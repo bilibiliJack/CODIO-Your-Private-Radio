@@ -1,4 +1,4 @@
-# CODIO 0.1.7 Preview — 2026-10-20
+# CODIO — Your Private Radio · 0.1.7 Preview · 2026-10-20
 
 本次为 Windows x64 便携预览版。完整解压后运行 `CODIO.exe`，无需 CODIO 云账户。
 
