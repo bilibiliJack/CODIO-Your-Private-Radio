@@ -6,7 +6,7 @@ CODIO 是一款面向 Windows 的私人电台播放器，把音乐推荐、听�
 
 ## 下载与开始
 
-**[下载 Windows x64 便携版](https://github.com/bs0612/Codio/releases/download/v0.1.7-preview.20261020/CODIO-0.1.7-Windows-x64-20261020.zip)** · [版本说明与校验文件](https://github.com/bs0612/Codio/releases/tag/v0.1.7-preview.20261020)
+**[下载 Windows x64 便携版](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/download/v0.1.7-preview.20261020/CODIO-0.1.7-Windows-x64-20261020.zip)** · [版本说明与校验文件](https://github.com/bs0612/CODIO-Your-Private-Radio/releases/tag/v0.1.7-preview.20261020)
 
 请下载 Release 附件中的 Windows ZIP。绿色 **Code → Download ZIP** 只会下载这个介绍仓库，不包含可运行程序。
 
