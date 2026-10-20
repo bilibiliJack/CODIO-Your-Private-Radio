@@ -1,4 +1,4 @@
-# CODIO
+# CODIO — Your Private Radio
 
 **陌生的歌曲，熟悉的听感。**
 
