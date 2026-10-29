@@ -2248,3 +2248,14 @@ input[type="range"]::-webkit-slider-thumb { appearance:none; width:10px; height:
   .profile-live-trail > button { justify-self:start; }
   .profile-listening-row > div:last-child { flex-shrink:1; }
 }
+
+/* Without GPU rasterization every backdrop blur re-filters the full area behind
+   it on each frame. Keep the same layout and tint, but use a denser glass base
+   instead of a live blur, and hold large pre-blurred washes still. */
+.radio-app[data-render-tier="software"] *,
+.radio-app[data-render-tier="software"] *::before,
+.radio-app[data-render-tier="software"] *::after { -webkit-backdrop-filter:none!important; backdrop-filter:none!important; }
+.radio-app[data-render-tier="software"] :is(.glass-card,.player-bar,.search-shell.active,.search-popover,.dj-panel,.profile-modal,.import-modal,.settings-modal,.model-modal,.onboarding-card,.np-edge-left,.np-edge-right,.np-edge-bottom,.toast,.atmosphere-next-card) { background-color:rgba(15,16,21,.84); }
+.radio-app[data-render-tier="software"] :is(.np-back,.np-settings,.atmosphere-context,.mood-core,.search-shell) { background-color:rgba(15,16,21,.62); }
+.radio-app[data-render-tier="software"] :is(.dj-panel-backdrop.visible,.modal-backdrop.visible,.onboarding-overlay) { background-color:rgba(1,2,3,.62); }
+.radio-app[data-render-tier="software"] :is(.now-cover-wash,.atmosphere-cover) { animation:none; }

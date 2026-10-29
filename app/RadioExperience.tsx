@@ -259,6 +259,180 @@ const PREPARED_TRACK_TTL_MS = 3 * 60 * 1000;
 type CoverPoint = { nx: number; ny: number; rgb: [number, number, number]; alpha: number; seed: number; radius?: number; angle?: number };
 type CoverPointPair = { from: CoverPoint; to: CoverPoint };
 
+type ParticleGlRenderer = {
+  resize: (deviceWidth: number, deviceHeight: number, ratio: number) => void;
+  begin: () => void;
+  push: (x: number, y: number, size: number, rgb: readonly number[], alpha: number) => void;
+  flush: () => void;
+  clear: () => void;
+};
+
+// The album field draws tens of thousands of squares per frame. Canvas 2D pays a
+// style parse and a draw call for each, so weaker machines had to drop density.
+// Point sprites carry the same squares to the GPU in one draw call; the fragment
+// shader reproduces fillRect's analytic edge coverage so the image is unchanged.
+const particleGlRenderers = new WeakMap<HTMLCanvasElement, ParticleGlRenderer>();
+const PARTICLE_VERTEX_BYTES = 16;
+const PARTICLE_VERTEX_SHADER = `
+attribute vec3 aRect;
+attribute vec4 aColor;
+uniform vec2 uResolution;
+uniform float uScale;
+varying vec4 vColor;
+varying vec4 vBounds;
+void main() {
+  float size = aRect.z * uScale;
+  vec2 topLeft = aRect.xy * uScale;
+  vec2 center = topLeft + size * .5;
+  gl_Position = vec4(center.x / uResolution.x * 2. - 1., 1. - center.y / uResolution.y * 2., 0., 1.);
+  gl_PointSize = ceil(size) + 2.;
+  float top = uResolution.y - topLeft.y;
+  vBounds = vec4(topLeft.x, top - size, topLeft.x + size, top);
+  vColor = aColor;
+}`;
+const PARTICLE_FRAGMENT_SHADER = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec4 vColor;
+varying vec4 vBounds;
+void main() {
+  vec2 span = clamp(min(gl_FragCoord.xy + .5, vBounds.zw) - max(gl_FragCoord.xy - .5, vBounds.xy), 0., 1.);
+  float alpha = vColor.a * span.x * span.y;
+  if (alpha <= 0.) discard;
+  gl_FragColor = vec4(vColor.rgb * alpha, alpha);
+}`;
+
+function createParticleGlRenderer(canvas: HTMLCanvasElement, gl: WebGLRenderingContext): ParticleGlRenderer | null {
+  let program: WebGLProgram | null = null;
+  let buffer: WebGLBuffer | null = null;
+  let resolutionUniform: WebGLUniformLocation | null = null;
+  let scaleUniform: WebGLUniformLocation | null = null;
+  let lost = false;
+  let size = { width: 1, height: 1, ratio: 1 };
+  let bytes = new Uint8ClampedArray(PARTICLE_VERTEX_BYTES * 4096);
+  let floats = new Float32Array(bytes.buffer);
+  let count = 0;
+
+  const compile = (type: number, code: string) => {
+    const shader = gl.createShader(type);
+    if (!shader) return null;
+    gl.shaderSource(shader, code);
+    gl.compileShader(shader);
+    return gl.getShaderParameter(shader, gl.COMPILE_STATUS) ? shader : null;
+  };
+  const applySize = () => {
+    gl.viewport(0, 0, size.width, size.height);
+    gl.uniform2f(resolutionUniform, size.width, size.height);
+    gl.uniform1f(scaleUniform, size.ratio);
+  };
+  const initialize = () => {
+    const vertex = compile(gl.VERTEX_SHADER, PARTICLE_VERTEX_SHADER);
+    const fragment = compile(gl.FRAGMENT_SHADER, PARTICLE_FRAGMENT_SHADER);
+    program = gl.createProgram();
+    buffer = gl.createBuffer();
+    if (!vertex || !fragment || !program || !buffer) return false;
+    gl.attachShader(program, vertex);
+    gl.attachShader(program, fragment);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return false;
+    gl.useProgram(program);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    const rect = gl.getAttribLocation(program, "aRect");
+    const color = gl.getAttribLocation(program, "aColor");
+    gl.enableVertexAttribArray(rect);
+    gl.vertexAttribPointer(rect, 3, gl.FLOAT, false, PARTICLE_VERTEX_BYTES, 0);
+    gl.enableVertexAttribArray(color);
+    gl.vertexAttribPointer(color, 4, gl.UNSIGNED_BYTE, true, PARTICLE_VERTEX_BYTES, 12);
+    resolutionUniform = gl.getUniformLocation(program, "uResolution");
+    scaleUniform = gl.getUniformLocation(program, "uScale");
+    gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.clearColor(0, 0, 0, 0);
+    applySize();
+    // Drivers may finish linking on first use. Pay that once here rather than
+    // inside the first measured frame that selects the particle density.
+    gl.bufferData(gl.ARRAY_BUFFER, bytes.subarray(0, PARTICLE_VERTEX_BYTES), gl.STREAM_DRAW);
+    gl.drawArrays(gl.POINTS, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    return true;
+  };
+  if (!initialize()) return null;
+  canvas.addEventListener("webglcontextlost", (event) => { event.preventDefault(); lost = true; });
+  canvas.addEventListener("webglcontextrestored", () => { lost = !initialize(); });
+
+  return {
+    resize(deviceWidth, deviceHeight, ratio) {
+      size = { width: Math.max(1, deviceWidth), height: Math.max(1, deviceHeight), ratio };
+      if (!lost) applySize();
+    },
+    begin() { count = 0; },
+    push(x, y, pointSize, rgb, alpha) {
+      if ((count + 1) * PARTICLE_VERTEX_BYTES > bytes.length) {
+        const grown = new Uint8ClampedArray(bytes.length * 2);
+        grown.set(bytes);
+        bytes = grown;
+        floats = new Float32Array(bytes.buffer);
+      }
+      const floatOffset = count * 4;
+      const byteOffset = count * PARTICLE_VERTEX_BYTES + 12;
+      floats[floatOffset] = x;
+      floats[floatOffset + 1] = y;
+      floats[floatOffset + 2] = pointSize;
+      bytes[byteOffset] = Math.round(rgb[0]);
+      bytes[byteOffset + 1] = Math.round(rgb[1]);
+      bytes[byteOffset + 2] = Math.round(rgb[2]);
+      bytes[byteOffset + 3] = Math.round(Math.min(1, alpha) * 255);
+      count += 1;
+    },
+    flush() {
+      if (lost) return;
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      if (!count) return;
+      gl.bufferData(gl.ARRAY_BUFFER, bytes.subarray(0, count * PARTICLE_VERTEX_BYTES), gl.STREAM_DRAW);
+      gl.drawArrays(gl.POINTS, 0, count);
+    },
+    clear() { count = 0; if (!lost) gl.clear(gl.COLOR_BUFFER_BIT); },
+  };
+}
+
+// Software WebGL is slower than Canvas 2D, so require a real GPU. A canvas that
+// has taken a WebGL context can never fall back to 2D, so prove the shaders on a
+// throwaway canvas before claiming the visible one.
+const PARTICLE_GL_OPTIONS: WebGLContextAttributes = {
+  alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false,
+  preserveDrawingBuffer: false, failIfMajorPerformanceCaveat: true,
+};
+let acceleratedWebGl: boolean | undefined;
+
+// Also tells the page whether the browser is rasterizing without a GPU, where
+// full-screen backdrop blurs cost far more than anything drawn on the canvases.
+function hasAcceleratedWebGl() {
+  if (acceleratedWebGl !== undefined) return acceleratedWebGl;
+  try {
+    const probe = document.createElement("canvas");
+    const probeGl = probe.getContext("webgl", PARTICLE_GL_OPTIONS);
+    acceleratedWebGl = Boolean(probeGl && createParticleGlRenderer(probe, probeGl));
+    probeGl?.getExtension("WEBGL_lose_context")?.loseContext();
+  } catch {
+    acceleratedWebGl = false;
+  }
+  return acceleratedWebGl;
+}
+
+function acquireParticleGlRenderer(canvas: HTMLCanvasElement) {
+  const existing = particleGlRenderers.get(canvas);
+  if (existing) return existing;
+  if (!hasAcceleratedWebGl()) return null;
+  const gl = canvas.getContext("webgl", PARTICLE_GL_OPTIONS);
+  const renderer = gl ? createParticleGlRenderer(canvas, gl) : null;
+  if (renderer) particleGlRenderers.set(canvas, renderer);
+  return renderer;
+}
+
 function setBoundedCache<K, V>(cache: Map<K, V>, key: K, value: V, limit: number) {
   cache.delete(key);
   cache.set(key, value);
@@ -721,6 +895,7 @@ export function RadioExperience() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const visualActiveRef = useRef(true);
   const nowCanvasRef = useRef<HTMLCanvasElement>(null);
+  const parallaxPointerRef = useRef({ clientX: 0, clientY: 0, frame: 0 });
   const progressWaveRef = useRef<HTMLCanvasElement>(null);
   const nowProgressWaveRef = useRef<HTMLCanvasElement>(null);
   const displayedWaveformRef = useRef<number[]>([]);
@@ -789,6 +964,7 @@ export function RadioExperience() {
   const activeQQTrackLiveRef = useRef<QQTrack | null>(null);
   const currentCoverDataLiveRef = useRef("");
   const currentTrackCoverLiveRef = useRef("");
+  const reducedMotionLiveRef = useRef(false);
   const initialRecommendationRef = useRef(false);
   const recoveringTrackRef = useRef<string | null>(null);
   const seamlessAttemptedRef = useRef<string | null>(null);
@@ -1269,6 +1445,10 @@ export function RadioExperience() {
   useEffect(() => { activeQQTrackLiveRef.current = activeQQTrack; }, [activeQQTrack]);
   useEffect(() => { currentCoverDataLiveRef.current = currentCoverData; }, [currentCoverData]);
   useEffect(() => { currentTrackCoverLiveRef.current = currentTrack.cover || ""; }, [currentTrack.cover]);
+  useEffect(() => { reducedMotionLiveRef.current = reducedMotion; }, [reducedMotion]);
+  useEffect(() => {
+    rootRef.current?.setAttribute("data-render-tier", hasAcceleratedWebGl() ? "gpu" : "software");
+  }, []);
 
   const transitionDisplayId = transitionDisplay?.id;
   useEffect(() => {
@@ -1707,6 +1887,15 @@ export function RadioExperience() {
     });
     if (!displayedWaveformRef.current.length) displayedWaveformRef.current = sampleWaveform(trackAnalysisRef.current.get(waveformKey)?.waveform
       || (initialWaveformRef.current.trackId === waveformKey ? initialWaveformRef.current.waveform : fallbackWaveform));
+    // Analysis waveforms are replaced, never mutated, so a resampled copy can be
+    // reused across frames instead of allocating several arrays per frame.
+    const sampledWaveforms = new WeakMap<number[], number[]>();
+    const sampledWaveform = (source: number[]) => {
+      let sampled = sampledWaveforms.get(source);
+      if (!sampled) { sampled = sampleWaveform(source); sampledWaveforms.set(source, sampled); }
+      return sampled;
+    };
+    const mixedWaveform: number[] = [];
 
     const resize = () => {
       lastDrawnProgress = -1;
@@ -1723,12 +1912,17 @@ export function RadioExperience() {
       if (document.hidden || !visualActiveRef.current) return;
       const runtime = activeTransitionRef.current;
       const transitionFrame = transitionVisualFrameRef.current;
-      const ordinaryWaveform = sampleWaveform(trackAnalysisRef.current.get(waveformKey)?.waveform
+      const ordinaryWaveform = sampledWaveform(trackAnalysisRef.current.get(waveformKey)?.waveform
         || (initialWaveformRef.current.trackId === waveformKey ? initialWaveformRef.current.waveform : fallbackWaveform));
-      const outgoingWaveform = runtime ? sampleWaveform(runtime.outgoingSnapshot.analysis.waveform || fallbackWaveform) : ordinaryWaveform;
-      const incomingWaveform = runtime ? sampleWaveform(runtime.incomingSnapshot.analysis.waveform || fallbackWaveform) : ordinaryWaveform;
+      const outgoingWaveform = runtime ? sampledWaveform(runtime.outgoingSnapshot.analysis.waveform || fallbackWaveform) : ordinaryWaveform;
+      const incomingWaveform = runtime ? sampledWaveform(runtime.incomingSnapshot.analysis.waveform || fallbackWaveform) : ordinaryWaveform;
       const waveformMix = runtime && transitionFrame ? transitionFrame.waveformMix : 0;
-      const targetWaveform = runtime ? outgoingWaveform.map((value, index) => value * (1 - waveformMix) + incomingWaveform[index] * waveformMix) : ordinaryWaveform;
+      let targetWaveform = ordinaryWaveform;
+      if (runtime) {
+        mixedWaveform.length = outgoingWaveform.length;
+        for (let index = 0; index < outgoingWaveform.length; index += 1) mixedWaveform[index] = outgoingWaveform[index] * (1 - waveformMix) + incomingWaveform[index] * waveformMix;
+        targetWaveform = mixedWaveform;
+      }
       const waveform = displayedWaveformRef.current;
       let changed = Boolean(runtime) || lastDrawnProgress !== progressValueRef.current;
       for (let index = 0; index < targetWaveform.length; index += 1) {
@@ -1811,8 +2005,9 @@ export function RadioExperience() {
   useEffect(() => {
     const canvas = nowCanvasRef.current;
     if (!canvas || !nowPlayingOpen) return;
-    const context = canvas.getContext("2d");
-    if (!context) return;
+    const glRenderer = typeof WebGLRenderingContext !== "undefined" ? acquireParticleGlRenderer(canvas) : null;
+    const context = glRenderer ? null : canvas.getContext("2d");
+    if (!glRenderer && !context) return;
 
     let frame = 0;
     let width = 0;
@@ -1923,7 +2118,8 @@ export function RadioExperience() {
       height = canvas.clientHeight;
       canvas.width = Math.floor(width * ratio);
       canvas.height = Math.floor(height * ratio);
-      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      if (glRenderer) glRenderer.resize(canvas.width, canvas.height, ratio);
+      else context?.setTransform(ratio, 0, 0, ratio, 0, 0);
       renderQualityKey = `${grid}:${width}:${height}:${ratio}`;
       const cachedStride = particleRenderStridesRef.current.get(renderQualityKey);
       particleStride = cachedStride || 1;
@@ -1983,7 +2179,7 @@ export function RadioExperience() {
       }
       const fallbackPoints = coverPoints;
       const pointCount = particleTransition.length ? particleTransition.length : fallbackPoints.length;
-      context.globalCompositeOperation = "source-over";
+      if (context) context.globalCompositeOperation = "source-over";
       const visualCenterX = width >= 900 && lyricMode === "minimal" ? width * .3 : width / 2;
       const influenceRadius = Math.min(126, Math.min(width, height) * .17);
       const influenceRadiusSquared = influenceRadius * influenceRadius;
@@ -2056,14 +2252,34 @@ export function RadioExperience() {
             x += (deltaX / Math.max(distance, 1)) * force;
             y += (deltaY / Math.max(distance, 1)) * force;
           }
-          context.fillStyle = transition ? `rgb(${Math.round(pointRgb[0])} ${Math.round(pointRgb[1])} ${Math.round(pointRgb[2])})` : cached.color;
           const edgeFalloff = transition ? Math.pow(Math.min(1, edge), 1.45) : cached.edgeFalloff;
-          context.globalAlpha = Math.max(0.24, pointAlpha * 1.08 - edgeFalloff * 0.25 + depth / 500);
+          const particleAlpha = Math.max(0.24, pointAlpha * 1.08 - edgeFalloff * 0.25 + depth / 500);
           const particleSize = Math.max(1.22, strideSize * (0.58 + (depth / size + 0.5) * 0.14 + music.pulse * 0.064) * (1 - edgeFalloff * 0.045));
+          if (glRenderer) {
+            glRenderer.push(x, y, particleSize, pointRgb, particleAlpha);
+            continue;
+          }
+          if (!context) continue;
+          context.fillStyle = transition ? `rgb(${Math.round(pointRgb[0])} ${Math.round(pointRgb[1])} ${Math.round(pointRgb[2])})` : cached.color;
+          context.globalAlpha = particleAlpha;
           context.fillRect(x, y, particleSize, particleSize);
       }
-      context.globalCompositeOperation = "source-over";
-      context.globalAlpha = 1;
+      if (context) {
+        context.globalCompositeOperation = "source-over";
+        context.globalAlpha = 1;
+      }
+    };
+    // Paint one complete field: Canvas 2D draws while iterating, WebGL submits
+    // the collected points in a single call.
+    const paintAlbum = (time: number) => {
+      if (glRenderer) {
+        glRenderer.begin();
+        drawAlbum(time);
+        glRenderer.flush();
+        return;
+      }
+      context?.clearRect(0, 0, width, height);
+      drawAlbum(time);
     };
 
     const draw = (time: number) => {
@@ -2124,20 +2340,22 @@ export function RadioExperience() {
         frame = window.requestAnimationFrame(draw);
         return;
       }
-      context.clearRect(0, 0, width, height);
-      const startedAt = performance.now();
-      drawAlbum(time);
+      let startedAt = performance.now();
+      paintAlbum(time);
       if (!renderQualitySelected && coverPoints.length) {
+        // On the GPU path the first pass is mostly cold-JIT point math; time a
+        // warm pass instead so a capable machine keeps its full density.
+        if (glRenderer) {
+          startedAt = performance.now();
+          paintAlbum(time);
+        }
         // Decide the draw budget before this first frame is presented, then
         // freeze it for this viewport. Never halve visible density twice later.
         const drawingMs = performance.now() - startedAt;
         particleStride = drawingMs > 26 ? 4 : drawingMs > 13 ? 2 : 1;
         setBoundedCache(particleRenderStridesRef.current, renderQualityKey, particleStride, 6);
         renderQualitySelected = true;
-        if (particleStride > 1) {
-          context.clearRect(0, 0, width, height);
-          drawAlbum(time);
-        }
+        if (particleStride > 1) paintAlbum(time);
       }
       paintDirty = false;
       pausedFrame = playing ? null : { audio, time: audio?.currentTime || 0, track: currentKey, cover: liveCover, analysis,
@@ -2152,9 +2370,12 @@ export function RadioExperience() {
     window.addEventListener("focus", resumeVisible);
     window.addEventListener("blur", suspendVisual);
     window.addEventListener("resize", resize);
+    const repaintRestored = () => { paintDirty = true; };
+    if (glRenderer) canvas.addEventListener("webglcontextrestored", repaintRestored);
     frame = window.requestAnimationFrame(draw);
     return () => {
       disposed = true;
+      if (glRenderer) canvas.removeEventListener("webglcontextrestored", repaintRestored);
       if (particleTransition.length) previousCoverPointsRef.current = particleTransition.map(({ to }) => to);
       else if (coverPoints.length) previousCoverPointsRef.current = coverPoints;
       window.cancelAnimationFrame(frame);
@@ -4571,13 +4792,24 @@ export function RadioExperience() {
 
   const handleParallax = (event: React.PointerEvent<HTMLDivElement>) => {
     if (!rootRef.current) return;
-    rootRef.current.style.setProperty("--cursor-x", `${event.clientX}px`);
-    rootRef.current.style.setProperty("--cursor-y", `${event.clientY}px`);
-    if (reducedMotion) return;
-    const x = event.clientX / window.innerWidth - 0.5;
-    const y = event.clientY / window.innerHeight - 0.5;
-    rootRef.current.style.setProperty("--mx", `${x * 29}px`);
-    rootRef.current.style.setProperty("--my", `${y * 23}px`);
+    // Root custom properties restyle the whole tree. High-rate mice can emit
+    // several events per frame, so write only the latest position once per frame.
+    const pending = parallaxPointerRef.current;
+    pending.clientX = event.clientX;
+    pending.clientY = event.clientY;
+    if (pending.frame) return;
+    pending.frame = window.requestAnimationFrame(() => {
+      pending.frame = 0;
+      const root = rootRef.current;
+      if (!root) return;
+      root.style.setProperty("--cursor-x", `${pending.clientX}px`);
+      root.style.setProperty("--cursor-y", `${pending.clientY}px`);
+      if (reducedMotionLiveRef.current) return;
+      const x = pending.clientX / window.innerWidth - 0.5;
+      const y = pending.clientY / window.innerHeight - 0.5;
+      root.style.setProperty("--mx", `${x * 29}px`);
+      root.style.setProperty("--my", `${y * 23}px`);
+    });
   };
 
   const handleCloudPointer = (event: React.PointerEvent<HTMLButtonElement>) => {
