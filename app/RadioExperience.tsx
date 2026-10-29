@@ -47,7 +47,7 @@ import { codioRequestFailure, didRequestedTrackStart, isOfflineCodioShortcut, ru
 import LyricsScroller from "./LyricsScroller";
 import { buildListeningPresentation } from "./listening-presentation";
 import { loadLyricsWithRetry } from "./codio-requests";
-import { readCodioOnboarding, saveCodioOnboarding, type CodioOnboardingState } from "./codio-onboarding";
+import { readCodioOnboarding, saveCodioOnboarding } from "./codio-onboarding";
 import {
   analyzePcmTrack,
   adaptTransitionPlan,
@@ -65,6 +65,13 @@ import {
   type TransitionPlan,
   type TransitionVisualFrame,
 } from "./seamless-dj";
+import { acquireParticleGlRenderer, hasAcceleratedWebGl } from "./particle-gl";
+import { acquireAuroraRenderer, parseCssColor } from "./aurora-gl";
+import { applyMediaSessionMetadata, applyMediaSessionPlaybackState, applyMediaSessionPosition, bindMediaSessionTransport, MEDIA_SESSION_SEEK_SECONDS } from "./media-session";
+import { createClockSleepTimer, createTrackSleepTimer, formatSleepRemaining, SLEEP_FADE_MS, SLEEP_TIMER_MINUTES, sleepTimerRemaining, sleepTimerTrackChanged, type SleepTimer } from "./sleep-timer";
+import { applyListeningBackup, backupFileName, buildListeningBackup, describeListeningBackup, ListeningBackupError, parseListeningBackup, serializeListeningBackup } from "./listening-backup";
+import { isTextEntryTarget, resolveShortcut, SHORTCUT_GUIDE, SHORTCUT_SEEK_SECONDS, SHORTCUT_VOLUME_STEP } from "./keyboard-shortcuts";
+import type { CodioAIMessage, CodioDesktopBridge, CodioToolCall, LyricLine, QQPlaybackResult, QQTasteSnapshot, QQTrack, SystemVolumeStatus } from "./radio-types";
 
 type Message = {
   id: number;
@@ -81,65 +88,6 @@ type QQConnectionStatus = "checking" | "unavailable" | "needs-auth" | "authorizi
 const NOW_INITIAL_RX = -7;
 const NOW_INITIAL_RY = 9;
 
-type QQMusicSdk = {
-  getAuthStatus: () => Promise<boolean>;
-  goAuthPage: () => void;
-  describeSelfSongList: () => Promise<unknown>;
-  describeRecentPlay?: (params: { Type: number; UpdateTime: number }) => Promise<unknown>;
-};
-
-type QQDesktopStatus = {
-  available: boolean;
-  loggedIn: boolean;
-  playbackReady: boolean;
-  authorizationRequired?: boolean;
-  connectionError?: "QQ_DESKTOP_AUTH_UNSUPPORTED";
-  userId?: string;
-};
-
-type QQTasteSnapshot = {
-  playlists: Array<{ id: string; name: string; trackCount: number }>;
-  tracks: QQTrack[];
-  playlistNames: string[];
-  likedCount: number;
-  topArtists: Array<{ name: string; weight: number }>;
-  coverage?: { partial: boolean; readPlaylistCount: number; completePlaylists: number; retainedPlaylists: number; syncedAt: number };
-};
-
-type QQTrack = {
-  provider: "qq" | "local";
-  id: string;
-  mid: string;
-  mediaMid?: string;
-  title: string;
-  artist: string;
-  album?: string;
-  albumMid?: string;
-  cover?: string;
-  fallbackCover?: string;
-  durationSeconds: number;
-  vipRequired?: boolean;
-  language?: string;
-  releaseDate?: string;
-  genres?: string[];
-  artistKnown?: boolean;
-  likedInProvider?: boolean;
-  likedEvidence?: { source: string; confidence: number; confirmed: boolean };
-  playlistMembership?: Array<{ id: string; name: string }>;
-};
-
-type QQPlaybackResult = {
-  playable: boolean;
-  url?: string;
-  expiresAt?: number;
-  quality?: string;
-  requiresLogin?: boolean;
-  failureKind?: string;
-  vipRequired?: boolean;
-  message?: string;
-};
-
-type LyricLine = { time: number; text: string };
 const lyricAtTime = (lines: LyricLine[], time: number) => lines.reduce((current, line) => line.time <= time ? line.text : current, "");
 
 function bootPreparationProgress(state: {
@@ -194,18 +142,6 @@ function buildStartupRecommendationSnapshot(tracks: QQTrack[], visible: string[]
 }
 
 type ProfileView = "overview" | "taste" | "rhythm" | "context";
-type AIStatus = {
-  provider: "deepseek";
-  configured: boolean;
-  model: "deepseek-v4-flash";
-  connectionMode: "user_api_key";
-};
-
-type CodioToolCall = { id: string; name: string; arguments: Record<string, unknown> };
-type CodioAIMessage =
-  | { role: "user" | "assistant"; content: string; toolCalls?: CodioToolCall[] }
-  | { role: "tool"; content: string; toolCallId: string };
-
 type MusicAudioChain = {
   source: MediaElementAudioSourceNode;
   analyser: AnalyserNode;
@@ -258,180 +194,6 @@ const PREPARED_TRACK_TTL_MS = 3 * 60 * 1000;
 
 type CoverPoint = { nx: number; ny: number; rgb: [number, number, number]; alpha: number; seed: number; radius?: number; angle?: number };
 type CoverPointPair = { from: CoverPoint; to: CoverPoint };
-
-type ParticleGlRenderer = {
-  resize: (deviceWidth: number, deviceHeight: number, ratio: number) => void;
-  begin: () => void;
-  push: (x: number, y: number, size: number, rgb: readonly number[], alpha: number) => void;
-  flush: () => void;
-  clear: () => void;
-};
-
-// The album field draws tens of thousands of squares per frame. Canvas 2D pays a
-// style parse and a draw call for each, so weaker machines had to drop density.
-// Point sprites carry the same squares to the GPU in one draw call; the fragment
-// shader reproduces fillRect's analytic edge coverage so the image is unchanged.
-const particleGlRenderers = new WeakMap<HTMLCanvasElement, ParticleGlRenderer>();
-const PARTICLE_VERTEX_BYTES = 16;
-const PARTICLE_VERTEX_SHADER = `
-attribute vec3 aRect;
-attribute vec4 aColor;
-uniform vec2 uResolution;
-uniform float uScale;
-varying vec4 vColor;
-varying vec4 vBounds;
-void main() {
-  float size = aRect.z * uScale;
-  vec2 topLeft = aRect.xy * uScale;
-  vec2 center = topLeft + size * .5;
-  gl_Position = vec4(center.x / uResolution.x * 2. - 1., 1. - center.y / uResolution.y * 2., 0., 1.);
-  gl_PointSize = ceil(size) + 2.;
-  float top = uResolution.y - topLeft.y;
-  vBounds = vec4(topLeft.x, top - size, topLeft.x + size, top);
-  vColor = aColor;
-}`;
-const PARTICLE_FRAGMENT_SHADER = `
-#ifdef GL_FRAGMENT_PRECISION_HIGH
-precision highp float;
-#else
-precision mediump float;
-#endif
-varying vec4 vColor;
-varying vec4 vBounds;
-void main() {
-  vec2 span = clamp(min(gl_FragCoord.xy + .5, vBounds.zw) - max(gl_FragCoord.xy - .5, vBounds.xy), 0., 1.);
-  float alpha = vColor.a * span.x * span.y;
-  if (alpha <= 0.) discard;
-  gl_FragColor = vec4(vColor.rgb * alpha, alpha);
-}`;
-
-function createParticleGlRenderer(canvas: HTMLCanvasElement, gl: WebGLRenderingContext): ParticleGlRenderer | null {
-  let program: WebGLProgram | null = null;
-  let buffer: WebGLBuffer | null = null;
-  let resolutionUniform: WebGLUniformLocation | null = null;
-  let scaleUniform: WebGLUniformLocation | null = null;
-  let lost = false;
-  let size = { width: 1, height: 1, ratio: 1 };
-  let bytes = new Uint8ClampedArray(PARTICLE_VERTEX_BYTES * 4096);
-  let floats = new Float32Array(bytes.buffer);
-  let count = 0;
-
-  const compile = (type: number, code: string) => {
-    const shader = gl.createShader(type);
-    if (!shader) return null;
-    gl.shaderSource(shader, code);
-    gl.compileShader(shader);
-    return gl.getShaderParameter(shader, gl.COMPILE_STATUS) ? shader : null;
-  };
-  const applySize = () => {
-    gl.viewport(0, 0, size.width, size.height);
-    gl.uniform2f(resolutionUniform, size.width, size.height);
-    gl.uniform1f(scaleUniform, size.ratio);
-  };
-  const initialize = () => {
-    const vertex = compile(gl.VERTEX_SHADER, PARTICLE_VERTEX_SHADER);
-    const fragment = compile(gl.FRAGMENT_SHADER, PARTICLE_FRAGMENT_SHADER);
-    program = gl.createProgram();
-    buffer = gl.createBuffer();
-    if (!vertex || !fragment || !program || !buffer) return false;
-    gl.attachShader(program, vertex);
-    gl.attachShader(program, fragment);
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return false;
-    gl.useProgram(program);
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    const rect = gl.getAttribLocation(program, "aRect");
-    const color = gl.getAttribLocation(program, "aColor");
-    gl.enableVertexAttribArray(rect);
-    gl.vertexAttribPointer(rect, 3, gl.FLOAT, false, PARTICLE_VERTEX_BYTES, 0);
-    gl.enableVertexAttribArray(color);
-    gl.vertexAttribPointer(color, 4, gl.UNSIGNED_BYTE, true, PARTICLE_VERTEX_BYTES, 12);
-    resolutionUniform = gl.getUniformLocation(program, "uResolution");
-    scaleUniform = gl.getUniformLocation(program, "uScale");
-    gl.disable(gl.DEPTH_TEST);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    gl.clearColor(0, 0, 0, 0);
-    applySize();
-    // Drivers may finish linking on first use. Pay that once here rather than
-    // inside the first measured frame that selects the particle density.
-    gl.bufferData(gl.ARRAY_BUFFER, bytes.subarray(0, PARTICLE_VERTEX_BYTES), gl.STREAM_DRAW);
-    gl.drawArrays(gl.POINTS, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    return true;
-  };
-  if (!initialize()) return null;
-  canvas.addEventListener("webglcontextlost", (event) => { event.preventDefault(); lost = true; });
-  canvas.addEventListener("webglcontextrestored", () => { lost = !initialize(); });
-
-  return {
-    resize(deviceWidth, deviceHeight, ratio) {
-      size = { width: Math.max(1, deviceWidth), height: Math.max(1, deviceHeight), ratio };
-      if (!lost) applySize();
-    },
-    begin() { count = 0; },
-    push(x, y, pointSize, rgb, alpha) {
-      if ((count + 1) * PARTICLE_VERTEX_BYTES > bytes.length) {
-        const grown = new Uint8ClampedArray(bytes.length * 2);
-        grown.set(bytes);
-        bytes = grown;
-        floats = new Float32Array(bytes.buffer);
-      }
-      const floatOffset = count * 4;
-      const byteOffset = count * PARTICLE_VERTEX_BYTES + 12;
-      floats[floatOffset] = x;
-      floats[floatOffset + 1] = y;
-      floats[floatOffset + 2] = pointSize;
-      bytes[byteOffset] = Math.round(rgb[0]);
-      bytes[byteOffset + 1] = Math.round(rgb[1]);
-      bytes[byteOffset + 2] = Math.round(rgb[2]);
-      bytes[byteOffset + 3] = Math.round(Math.min(1, alpha) * 255);
-      count += 1;
-    },
-    flush() {
-      if (lost) return;
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      if (!count) return;
-      gl.bufferData(gl.ARRAY_BUFFER, bytes.subarray(0, count * PARTICLE_VERTEX_BYTES), gl.STREAM_DRAW);
-      gl.drawArrays(gl.POINTS, 0, count);
-    },
-    clear() { count = 0; if (!lost) gl.clear(gl.COLOR_BUFFER_BIT); },
-  };
-}
-
-// Software WebGL is slower than Canvas 2D, so require a real GPU. A canvas that
-// has taken a WebGL context can never fall back to 2D, so prove the shaders on a
-// throwaway canvas before claiming the visible one.
-const PARTICLE_GL_OPTIONS: WebGLContextAttributes = {
-  alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false,
-  preserveDrawingBuffer: false, failIfMajorPerformanceCaveat: true,
-};
-let acceleratedWebGl: boolean | undefined;
-
-// Also tells the page whether the browser is rasterizing without a GPU, where
-// full-screen backdrop blurs cost far more than anything drawn on the canvases.
-function hasAcceleratedWebGl() {
-  if (acceleratedWebGl !== undefined) return acceleratedWebGl;
-  try {
-    const probe = document.createElement("canvas");
-    const probeGl = probe.getContext("webgl", PARTICLE_GL_OPTIONS);
-    acceleratedWebGl = Boolean(probeGl && createParticleGlRenderer(probe, probeGl));
-    probeGl?.getExtension("WEBGL_lose_context")?.loseContext();
-  } catch {
-    acceleratedWebGl = false;
-  }
-  return acceleratedWebGl;
-}
-
-function acquireParticleGlRenderer(canvas: HTMLCanvasElement) {
-  const existing = particleGlRenderers.get(canvas);
-  if (existing) return existing;
-  if (!hasAcceleratedWebGl()) return null;
-  const gl = canvas.getContext("webgl", PARTICLE_GL_OPTIONS);
-  const renderer = gl ? createParticleGlRenderer(canvas, gl) : null;
-  if (renderer) particleGlRenderers.set(canvas, renderer);
-  return renderer;
-}
 
 function setBoundedCache<K, V>(cache: Map<K, V>, key: K, value: V, limit: number) {
   cache.delete(key);
@@ -521,56 +283,6 @@ function spatiallyPairCoverPoints(from: CoverPoint[], to: CoverPoint[]): CoverPo
     const source = from[Math.min(from.length - 1, Math.floor(index * from.length / count))];
     return { from: source, to: takeNearestBucketPoint(source) };
   });
-}
-
-type SystemVolumeStatus = { available: boolean; volume: number | null; muted: boolean; error?: string; revision?: number };
-
-type CodioDesktopBridge = {
-  isDesktop: true;
-  systemVolume?: {
-    getStatus: () => Promise<SystemVolumeStatus>;
-    setVolume: (value: number) => Promise<SystemVolumeStatus>;
-    subscribe: (listener: (status: SystemVolumeStatus) => void) => () => void;
-  };
-  localMusic: {
-    import: (mode: "files" | "folder") => Promise<{ ok: boolean; cancelled?: boolean; scanned?: number; imported: number; duplicates: number; failed: number; capped?: boolean; tracks: QQTrack[] }>;
-    library: () => Promise<QQTrack[]>;
-  };
-  qqMusic: {
-    getStatus: () => Promise<QQDesktopStatus>;
-    login: (options?: { forceAuthorization?: boolean }) => Promise<QQDesktopStatus>;
-    logout: () => Promise<QQDesktopStatus>;
-    search: (query: string, page?: number) => Promise<QQTrack[]>;
-    metadata?: (trackId: string) => Promise<{ ok: boolean; mid?: string; genres?: string[]; language?: string; releaseDate?: string; source?: string; confidence?: number }>;
-    lyrics: (track: QQTrack) => Promise<LyricLine[]>;
-    library: (options?: { force?: boolean }) => Promise<QQTasteSnapshot>;
-    play: (track: QQTrack) => Promise<QQPlaybackResult>;
-    cover: (url: string) => Promise<string>;
-  };
-  ai: {
-    getStatus: () => Promise<AIStatus>;
-    saveKey: (key: string) => Promise<AIStatus>;
-    clearKey: () => Promise<AIStatus>;
-    step: (request: { messages: CodioAIMessage[]; context: Record<string, unknown> }) => Promise<{ content: string; toolCalls: CodioToolCall[] }>;
-  };
-  onboarding: {
-    get: () => Promise<CodioOnboardingState>;
-    save: (state: CodioOnboardingState) => Promise<CodioOnboardingState>;
-  };
-  analysis: {
-    get: (trackId: string, version?: number) => Promise<TrackAnalysis | null>;
-    save: (trackId: string, analysis: TrackAnalysis) => Promise<boolean>;
-  };
-};
-
-declare global {
-  interface Window {
-    h5PanelSdk?: { qqMusic?: QQMusicSdk };
-    codioDesktop?: CodioDesktopBridge;
-    codioRecommendationDiagnostics?: Record<string, unknown>[];
-    codioPlaybackDiagnostics?: Record<string, unknown>[];
-    codioPreparationDiagnostics?: Record<string, unknown>;
-  }
 }
 
 const qqCoverUrl = (albumMid: string) => `https://y.qq.com/music/photo_new/T002R300x300M000${albumMid}.jpg?max_age=2592000`;
@@ -2014,6 +1726,8 @@ export function RadioExperience() {
     let height = 0;
     let disposed = false;
     let smoothedBass = 0;
+    // Halo strength for the GPU pass: a quiet base that swells with the beat.
+    let fieldGlow = 0;
     const grid = particleLevel === 0 ? 120 : particleLevel === 1 ? 164 : window.innerWidth < 720 ? 180 : 192;
     const coverSource = currentCoverDataLiveRef.current || activeQQTrackLiveRef.current?.cover || currentTrackCoverLiveRef.current || "";
     const trackKey = () => activeQQTrackLiveRef.current?.mid || currentTrackCoverLiveRef.current;
@@ -2129,6 +1843,7 @@ export function RadioExperience() {
     const drawAlbum = (time: number) => {
       const pointer = nowPointerRef.current;
       const music = rhythm();
+      fieldGlow = reducedMotion ? 0 : Math.min(1, .18 + music.pulse * .95 + music.breath * .12);
       const transitionRuntime = activeTransitionRef.current;
       const transitionFrame = transitionVisualFrameRef.current;
       const liveTrack = activeQQTrackLiveRef.current;
@@ -2275,7 +1990,7 @@ export function RadioExperience() {
       if (glRenderer) {
         glRenderer.begin();
         drawAlbum(time);
-        glRenderer.flush();
+        glRenderer.flush(fieldGlow);
         return;
       }
       context?.clearRect(0, 0, width, height);
@@ -3317,11 +3032,11 @@ export function RadioExperience() {
           plan = cachedPlan;
         }
         const reachedPlannedCue = Boolean(plan && audio.currentTime >= plan.outgoingCue - .08);
-        if (seamlessRef.current && !userPausedRef.current && !audio.paused && remaining > 0.35 && reachedPlannedCue && activeQueueIndexRef.current >= 0 && activeQueueIndexRef.current < playQueueRef.current.length - 1 && !seamlessTransitionRef.current && seamlessAttemptedRef.current !== trackKey) {
+        if (seamlessRef.current && !audio.loop && !userPausedRef.current && !audio.paused && remaining > 0.35 && reachedPlannedCue && activeQueueIndexRef.current >= 0 && activeQueueIndexRef.current < playQueueRef.current.length - 1 && !seamlessTransitionRef.current && seamlessAttemptedRef.current !== trackKey) {
           seamlessAttemptedRef.current = trackKey;
           void beginSeamlessCrossfade(trackKey);
         }
-        if (remaining <= 0.16 && audio.currentTime > .8 && !audio.paused && !userPausedRef.current && !seamlessTransitionRef.current) advanceFromFinishedAudio(audio);
+        if (remaining <= 0.16 && audio.currentTime > .8 && !audio.paused && !audio.loop && !userPausedRef.current && !seamlessTransitionRef.current) advanceFromFinishedAudio(audio);
       }
     };
     audio.onplay = () => {
@@ -5669,6 +5384,325 @@ export function RadioExperience() {
     } catch { setImportState("idle"); notifySystem("本地导入失败", "error", "原音乐库保持不变"); }
   };
 
+  // ---- Playback conveniences: repeat, sleep timer, media keys, shortcuts, queue edits, backup ----
+  const [repeatOne, setRepeatOne] = useState(false);
+  const [sleepTimer, setSleepTimer] = useState<SleepTimer | null>(null);
+  const [sleepRemaining, setSleepRemaining] = useState(0);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [backupNotice, setBackupNotice] = useState("");
+  const sleepTimerRef = useRef<SleepTimer | null>(null);
+  const sleepFadeStartedRef = useRef(false);
+  const backupInputRef = useRef<HTMLInputElement>(null);
+  const auroraCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  const toggleRepeat = () => {
+    const next = !repeatOne;
+    setRepeatOne(next);
+    setToast(next ? "单曲循环已开启，这首歌会一直播下去" : "单曲循环已关闭");
+  };
+  // Native looping restarts the element gaplessly and never fires `ended`, so
+  // the queue, listening session and lyrics clock all keep working unchanged.
+  useEffect(() => {
+    const audio = musicAudioRef.current;
+    if (audio) audio.loop = repeatOne;
+    for (const element of audioElementsRef.current) if (element !== audio) element.loop = false;
+  }, [repeatOne, activeQQTrack?.mid]);
+
+  const seekToSeconds = (seconds: number) => {
+    const duration = playbackTime.duration || musicAudioRef.current?.duration || 0;
+    if (!(duration > 0)) return;
+    seekPlayback(Math.max(0, Math.min(100, (seconds / duration) * 100)));
+  };
+  const seekBySeconds = (delta: number) => {
+    const audio = musicAudioRef.current;
+    if (!audio?.src) return;
+    seekToSeconds(audio.currentTime + delta);
+  };
+
+  const startSleepTimer = (minutes: number | "track") => {
+    const timer = minutes === "track"
+      ? createTrackSleepTimer(activeQQTrack?.mid || currentTrack.title)
+      : createClockSleepTimer(minutes);
+    if (!timer) return;
+    if (sleepFadeStartedRef.current) {
+      const audio = musicAudioRef.current;
+      if (audio && !audio.paused) void fadeMusicVolume(audio, analyserNodesRef.current.get(audio) ? 1 : getPlayerVolumeScalar(), 500);
+    }
+    sleepTimerRef.current = timer;
+    sleepFadeStartedRef.current = false;
+    setSleepTimer(timer);
+    setSleepRemaining(sleepTimerRemaining(timer) || 0);
+    setToast(timer.kind === "track" ? "这首歌结束后电台会停下" : `${minutes} 分钟后电台会轻轻停下`);
+  };
+  const cancelSleepTimer = (quiet = false) => {
+    if (!sleepTimerRef.current) return;
+    sleepTimerRef.current = null;
+    setSleepTimer(null);
+    setSleepRemaining(0);
+    if (sleepFadeStartedRef.current) {
+      sleepFadeStartedRef.current = false;
+      const audio = musicAudioRef.current;
+      if (audio && !audio.paused && !userPausedRef.current) void fadeMusicVolume(audio, analyserNodesRef.current.get(audio) ? 1 : getPlayerVolumeScalar(), 600);
+    }
+    if (!quiet) setToast("睡眠定时已取消");
+  };
+  const finishSleepTimer = async () => {
+    sleepTimerRef.current = null;
+    sleepFadeStartedRef.current = false;
+    setSleepTimer(null);
+    setSleepRemaining(0);
+    const audio = musicAudioRef.current;
+    if (audio?.src && !audio.paused && !userPausedRef.current) await togglePlayback();
+    setToast("晚安。电台已停下，进度已保留");
+  };
+
+  // Effects reach the latest handlers through one ref so none of them has to
+  // restart when a handler identity changes between renders.
+  const transportRef = useRef({ togglePlayback, nextTrack, previousTrack, seekToSeconds, seekBySeconds, changeVolume, recordCurrentPreference, toggleRepeat, finishSleepTimer, fadeMusicVolume });
+  transportRef.current = { togglePlayback, nextTrack, previousTrack, seekToSeconds, seekBySeconds, changeVolume, recordCurrentPreference, toggleRepeat, finishSleepTimer, fadeMusicVolume };
+
+  useEffect(() => {
+    if (!sleepTimer) return;
+    const tick = () => {
+      const timer = sleepTimerRef.current;
+      if (!timer) return;
+      const audio = musicAudioRef.current;
+      const remaining = timer.kind === "clock"
+        ? sleepTimerRemaining(timer)
+        : audio && Number.isFinite(audio.duration) && audio.duration > 0 ? Math.max(0, (audio.duration - audio.currentTime) * 1000) : null;
+      if (timer.kind === "clock") setSleepRemaining(remaining ?? 0);
+      const playing = Boolean(audio?.src && !audio.paused && !userPausedRef.current);
+      if (audio && remaining !== null && remaining <= SLEEP_FADE_MS && playing && !sleepFadeStartedRef.current) {
+        sleepFadeStartedRef.current = true;
+        void transportRef.current.fadeMusicVolume(audio, 0, Math.max(400, remaining));
+      }
+      if (remaining !== null && remaining <= (timer.kind === "clock" ? 0 : 1200)) void transportRef.current.finishSleepTimer();
+    };
+    tick();
+    const interval = window.setInterval(tick, 1000);
+    return () => window.clearInterval(interval);
+  }, [sleepTimer]);
+  const sleepTrackKey = activeQQTrack?.mid || "";
+  useEffect(() => {
+    if (sleepTimerTrackChanged(sleepTimerRef.current, sleepTrackKey)) void transportRef.current.finishSleepTimer();
+  }, [sleepTrackKey]);
+
+  // Hardware media keys, the Windows media overlay and headset buttons.
+  useEffect(() => {
+    const session = typeof navigator !== "undefined" ? navigator.mediaSession : undefined;
+    if (!session) return;
+    return bindMediaSessionTransport(session, {
+      play: () => { const audio = musicAudioRef.current; if (!audio?.src || audio.paused) void transportRef.current.togglePlayback(); },
+      pause: () => { const audio = musicAudioRef.current; if (audio?.src && !audio.paused) void transportRef.current.togglePlayback(); },
+      previoustrack: () => void transportRef.current.previousTrack(),
+      nexttrack: () => void transportRef.current.nextTrack(),
+      seekto: (seconds) => transportRef.current.seekToSeconds(seconds),
+      seekbackward: (seconds) => transportRef.current.seekBySeconds(-(seconds || MEDIA_SESSION_SEEK_SECONDS)),
+      seekforward: (seconds) => transportRef.current.seekBySeconds(seconds || MEDIA_SESSION_SEEK_SECONDS),
+    });
+  }, []);
+  const mediaArtwork = currentCoverData || currentTrack.cover || activeQQTrack?.fallbackCover || "";
+  useEffect(() => {
+    const session = typeof navigator !== "undefined" ? navigator.mediaSession : undefined;
+    if (!session) return;
+    const hasTrack = Boolean(activeQQTrack || currentTrack.title);
+    applyMediaSessionMetadata(session, hasTrack ? { title: currentTrack.title, artist: currentTrack.artist, album: activeQQTrack?.album, artwork: mediaArtwork } : null,
+      typeof MediaMetadata !== "undefined" ? MediaMetadata : undefined);
+    applyMediaSessionPlaybackState(session, isPlaying, hasTrack);
+  }, [activeQQTrack, currentTrack.title, currentTrack.artist, mediaArtwork, isPlaying]);
+  useEffect(() => {
+    if (typeof navigator === "undefined") return;
+    applyMediaSessionPosition(navigator.mediaSession, playbackTime.duration, playbackTime.current, musicAudioRef.current?.playbackRate);
+  }, [playbackTime]);
+
+  const leaveNowPlaying = () => {
+    if (edgeIntentRef.current.timer) window.clearTimeout(edgeIntentRef.current.timer);
+    edgeIntentRef.current = { zone: null, timer: null };
+    nowPointerRef.current.dragging = false;
+    nowPointerRef.current.returning = false;
+    setNowPlayingEdge(null);
+    setNowPlayingOpen(false);
+  };
+  const overlayState = { shortcutsOpen, settingsOpen, djOpen, profileOpen, importOpen, modelOpen, searchOpen, nowPlayingOpen };
+  const overlayRef = useRef(overlayState);
+  overlayRef.current = overlayState;
+  useEffect(() => {
+    if (bootPhase !== "done") return;
+    const handleShortcut = (event: globalThis.KeyboardEvent) => {
+      if (isTextEntryTarget(event.target as HTMLElement | null)) return;
+      const action = resolveShortcut(event);
+      if (!action) return;
+      const overlays = overlayRef.current;
+      if (action === "close") {
+        if (overlays.shortcutsOpen) setShortcutsOpen(false);
+        else if (overlays.settingsOpen) setSettingsOpen(false);
+        else if (overlays.djOpen) setDjOpen(false);
+        else if (overlays.profileOpen) setProfileOpen(false);
+        else if (overlays.importOpen) setImportOpen(false);
+        else if (overlays.modelOpen) setModelOpen(false);
+        else if (overlays.searchOpen) setSearchOpen(false);
+        else if (overlays.nowPlayingOpen) leaveNowPlaying();
+        else return;
+        event.preventDefault();
+        return;
+      }
+      event.preventDefault();
+      const continuous = action === "seek-backward" || action === "seek-forward" || action === "volume-up" || action === "volume-down";
+      if (event.repeat && !continuous) return;
+      const transport = transportRef.current;
+      switch (action) {
+        case "seek-backward": transport.seekBySeconds(-SHORTCUT_SEEK_SECONDS); break;
+        case "seek-forward": transport.seekBySeconds(SHORTCUT_SEEK_SECONDS); break;
+        case "volume-up": void transport.changeVolume(Math.min(100, Math.round(volumeRef.current) + SHORTCUT_VOLUME_STEP)); break;
+        case "volume-down": void transport.changeVolume(Math.max(0, Math.round(volumeRef.current) - SHORTCUT_VOLUME_STEP)); break;
+        case "next-track": void transport.nextTrack(); break;
+        case "previous-track": void transport.previousTrack(); break;
+        case "like": transport.recordCurrentPreference("like"); break;
+        case "dislike": transport.recordCurrentPreference("dislike"); break;
+        case "toggle-repeat": transport.toggleRepeat(); break;
+        case "toggle-seamless": setSeamless((value) => !value); break;
+        case "toggle-now-playing": if (overlays.nowPlayingOpen) leaveNowPlaying(); else setNowPlayingOpen(true); break;
+        case "focus-search":
+          setSearchOpen(true);
+          window.setTimeout(() => searchShellRef.current?.querySelector<HTMLInputElement>("input")?.focus(), 0);
+          break;
+        case "toggle-help": setShortcutsOpen((open) => !open); break;
+      }
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [bootPhase]);
+
+  const removeFromQueue = (mid: string) => {
+    const queue = playQueueRef.current;
+    const index = queue.findIndex((item) => item.mid === mid);
+    if (index < 0 || index === activeQueueIndexRef.current) return;
+    if (activeTransitionRef.current?.incomingSnapshot.track.mid === mid) {
+      setToast("这首歌已经在衔接中，无法移出");
+      return;
+    }
+    const next = queue.filter((_, position) => position !== index);
+    playQueueRef.current = next;
+    setPlayQueue(next);
+    if (index < activeQueueIndexRef.current) {
+      activeQueueIndexRef.current -= 1;
+      setActiveQueueIndex(activeQueueIndexRef.current);
+    }
+    manualQueueIdsRef.current.delete(mid);
+    seamlessAttemptedRef.current = null;
+    const current = activeQQTrackLiveRef.current;
+    if (current && index === activeQueueIndexRef.current + 1) prepareUpcomingTrack(current.mid);
+    setToast("已移出队列");
+  };
+
+  const exportListeningData = () => {
+    try {
+      const backup = buildListeningBackup(window.localStorage);
+      const blob = new Blob([serializeListeningBackup(backup)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = backupFileName();
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+      setBackupNotice(`已导出 ${anchor.download} · ${describeListeningBackup(backup)}`);
+    } catch {
+      setBackupNotice("导出失败：无法读取本机记录");
+    }
+  };
+  const importListeningData = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const backup = parseListeningBackup(await file.text());
+      const { applied } = applyListeningBackup(window.localStorage, backup);
+      setBackupNotice(`已恢复 ${applied} 项 · ${describeListeningBackup(backup)} · 正在重新载入`);
+      setToast("听歌记忆已恢复，电台正在重新载入");
+      // Reload before any in-memory state can write over the restored records.
+      listeningMemoryHydratedRef.current = false;
+      window.setTimeout(() => window.location.reload(), 400);
+    } catch (error) {
+      const code = error instanceof ListeningBackupError ? error.code : "";
+      setBackupNotice(code === "BACKUP_NOT_CODIO" ? "这不是 CODIO 备份文件"
+        : code === "BACKUP_VERSION" ? "备份版本与当前程序不兼容"
+        : code === "BACKUP_EMPTY" ? "备份里没有可恢复的记录"
+        : "无法读取这个文件");
+    }
+  };
+
+  // A slow aurora behind the dashboard, lit by the bass. GPU tier only; the
+  // software tier keeps the CSS washes, and the opaque Now Playing hides it.
+  useEffect(() => {
+    const canvas = auroraCanvasRef.current;
+    if (!canvas || nowPlayingOpen || particleLevel === 0 || bootPhase === "playing" || !hasAcceleratedWebGl()) return;
+    const sky = acquireAuroraRenderer(canvas);
+    if (!sky) return;
+    let frame = 0;
+    let energy = 0;
+    let lastPaint = 0;
+    let frequency: Uint8Array<ArrayBuffer> | null = null;
+    const startedAt = performance.now();
+    const style = rootRef.current ? getComputedStyle(rootRef.current) : null;
+    const palette = {
+      a: parseCssColor(style?.getPropertyValue("--scene-a"), [.47, .51, .78]),
+      b: parseCssColor(style?.getPropertyValue("--scene-b"), [.15, .18, .32]),
+      c: parseCssColor(style?.getPropertyValue("--scene-c"), [.66, .52, .56]),
+      accent: parseCssColor(style?.getPropertyValue("--accent"), [.73, .79, 1]),
+    };
+    const opacity = particleLevel === 1 ? .55 : .8;
+    const resize = () => {
+      // A quarter-resolution buffer is plenty for a blurred sky.
+      const ratio = Math.min(window.devicePixelRatio || 1, 1) * .5;
+      canvas.width = Math.max(1, Math.floor(canvas.clientWidth * ratio));
+      canvas.height = Math.max(1, Math.floor(canvas.clientHeight * ratio));
+      sky.resize(canvas.width, canvas.height);
+    };
+    const paint = (now: number) => {
+      frame = 0;
+      if (document.hidden || !visualActiveRef.current) return;
+      // Half the display rate is invisible on a feature this soft and halves its cost.
+      if (now - lastPaint < 30) { frame = window.requestAnimationFrame(paint); return; }
+      lastPaint = now;
+      const audio = musicAudioRef.current;
+      const analyser = audio ? analyserNodesRef.current.get(audio)?.analyser : null;
+      let target = 0;
+      if (audio && analyser && !audio.paused && !userPausedRef.current) {
+        if (!frequency || frequency.length !== analyser.frequencyBinCount) frequency = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(frequency);
+        const bins = Math.min(20, frequency.length);
+        let sum = 0;
+        for (let index = 1; index < bins; index += 1) sum += frequency[index];
+        target = sum / Math.max(1, bins - 1) / 255;
+      }
+      energy += (target - energy) * (target > energy ? .12 : .04);
+      const pointer = parallaxPointerRef.current;
+      sky.render({
+        time: (now - startedAt) / 1000,
+        energy,
+        pointerX: pointer.clientX / Math.max(1, window.innerWidth) - .5,
+        pointerY: .5 - pointer.clientY / Math.max(1, window.innerHeight),
+        opacity,
+        palette,
+      });
+      if (!reducedMotion) frame = window.requestAnimationFrame(paint);
+    };
+    resize();
+    const suspend = () => { window.cancelAnimationFrame(frame); frame = 0; };
+    const resume = () => { if (!document.hidden && visualActiveRef.current && !frame) frame = window.requestAnimationFrame(paint); };
+    const resizeVisible = () => { resize(); lastPaint = 0; resume(); };
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("focus", resume);
+    window.addEventListener("blur", suspend);
+    window.addEventListener("resize", resizeVisible);
+    frame = window.requestAnimationFrame(paint);
+    return () => {
+      suspend();
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("focus", resume);
+      window.removeEventListener("blur", suspend);
+      window.removeEventListener("resize", resizeVisible);
+    };
+  }, [nowPlayingOpen, particleLevel, reducedMotion, scene, bootPhase]);
+
   const startImport = () => {
     if (importSource === "qq") {
       if (qqConnection === "connected") {
@@ -5911,6 +5945,7 @@ export function RadioExperience() {
           </section>
         </div>
       )}
+      <canvas ref={auroraCanvasRef} className="aurora-field" aria-hidden="true" />
       <canvas ref={canvasRef} className="particle-field" aria-hidden="true" />
       <div className="cursor-field" aria-hidden="true" />
       <div className="ambient ambient-one" />
@@ -6019,6 +6054,7 @@ export function RadioExperience() {
             <span className="qq-connect-copy"><strong>{qqConnection === "connected" ? "QQ CONNECTED" : "QQ MUSIC"}</strong><small>{qqConnection === "connected" ? "MEMBER ACCESS READY" : "CONNECT MEMBERSHIP"}</small></span>
             <span>↗</span>
           </button>
+          {sleepTimer && <button className="sleep-pill" title="点击取消睡眠定时" aria-label="取消睡眠定时" onClick={() => cancelSleepTimer()}>☾ {sleepTimer.kind === "track" ? "END OF SONG" : formatSleepRemaining(sleepRemaining)}</button>}
           <button className="icon-button settings-button" aria-label="打开设置" onClick={() => setSettingsOpen(true)}>⌘</button>
         </nav>
       </header>
@@ -6198,7 +6234,7 @@ export function RadioExperience() {
             <button aria-label="上一首" onClick={() => void previousTrack()}>‹</button>
             <button className="play-pause" aria-label={isPlaying ? "暂停" : "播放"} onClick={() => void togglePlayback()}>{isPlaying ? "Ⅱ" : "▶"}</button>
             <button aria-label="下一首" onClick={() => void nextTrack()}>›</button>
-            <button aria-label="循环播放">↻</button>
+            <button className={`repeat-toggle ${repeatOne ? "active" : ""}`} aria-label={repeatOne ? "关闭单曲循环" : "单曲循环"} aria-pressed={repeatOne} title="单曲循环 (R)" onClick={toggleRepeat}>↻</button>
           </div>
           <div className="progress-row" style={{ "--progress": `${progress}%` } as React.CSSProperties}>
             {transitionDisplay && activeTransitionRef.current?.id === transitionDisplay.id ? <span className="transition-time-stack"><span className="transition-outgoing">{formatTime(activeTransitionRef.current.outgoing.currentTime)}</span><span className="transition-incoming">{formatTime(activeTransitionRef.current.incoming.currentTime)}</span></span> : <span>{activeQQTrack ? formatTime(playbackTime.current) : formatProgress(progress)}</span>}
@@ -6278,7 +6314,10 @@ export function RadioExperience() {
         <header className="np-edge np-edge-top">
           <button className="np-back" onPointerDown={(event) => event.stopPropagation()} onClick={closeNowPlaying}>← <span>BACK TO CODIO</span></button>
           <div className="np-mode-title"><small>VISUAL FIELD</small><strong>{visualModes.find((item) => item.id === visualMode)?.label}</strong></div>
-          <button className="np-settings" onClick={() => setSettingsOpen(true)}>VISUALS <span>⌘</span></button>
+          <span className="np-top-tools">
+            {sleepTimer && <button className="sleep-pill" title="点击取消睡眠定时" aria-label="取消睡眠定时" onClick={() => cancelSleepTimer()}>☾ {sleepTimer.kind === "track" ? "END OF SONG" : formatSleepRemaining(sleepRemaining)}</button>}
+            <button className="np-settings" onClick={() => setSettingsOpen(true)}>VISUALS <span>⌘</span></button>
+          </span>
         </header>
 
         <aside className="np-edge np-edge-left" onWheel={(event) => event.stopPropagation()}>
@@ -6287,16 +6326,22 @@ export function RadioExperience() {
             {nowPlayingQueue.map((track, index) => {
               const isQQTrack = "mid" in track;
               const active = isQQTrack ? index === activeQueueIndex : index === trackIndex;
+              const upNext = isQQTrack && index === activeQueueIndex + 1;
               return (
-                <button
-                  key={isQQTrack ? track.mid : track.title}
-                  className={`${active ? "active" : ""} ${transitionDisplay && isQQTrack && track.mid === transitionDisplay.incoming.track.mid ? "transition-target" : ""}`}
-                  onClick={() => isQQTrack ? void selectQQTrack(track, playQueue) : selectTrack(index)}
-                >
-                  <span>{active ? "▶" : String(index + 1).padStart(2, "0")}</span>
-                  <strong>{track.title}</strong>
-                  <small>{track.artist}</small>
-                </button>
+                <div key={isQQTrack ? track.mid : track.title} className={`np-queue-item ${active ? "active" : ""} ${transitionDisplay && isQQTrack && track.mid === transitionDisplay.incoming.track.mid ? "transition-target" : ""}`}>
+                  <button
+                    className={`np-queue-main ${active ? "active" : ""}`}
+                    onClick={() => isQQTrack ? void selectQQTrack(track, playQueue) : selectTrack(index)}
+                  >
+                    <span>{active ? "▶" : String(index + 1).padStart(2, "0")}</span>
+                    <strong>{track.title}</strong>
+                    <small>{track.artist}</small>
+                  </button>
+                  {isQQTrack && !active && <span className="np-queue-actions">
+                    {!upNext && <button type="button" aria-label={`下一首播放 ${track.title}`} title="下一首播放" onClick={() => void enqueueNext(track)}>⤴</button>}
+                    <button type="button" aria-label={`移出队列 ${track.title}`} title="移出队列" onClick={() => removeFromQueue(track.mid)}>×</button>
+                  </span>}
+                </div>
               );
             })}
           </div>
@@ -6326,7 +6371,7 @@ export function RadioExperience() {
               <button aria-label="上一首" onClick={() => void previousTrack()}>‹</button>
               <button className="play-pause" aria-label={isPlaying ? "暂停" : "播放"} onClick={() => void togglePlayback()}>{isPlaying ? "Ⅱ" : "▶"}</button>
               <button aria-label="下一首" onClick={() => void nextTrack()}>›</button>
-              <button aria-label="循环播放">↻</button>
+              <button className={`repeat-toggle ${repeatOne ? "active" : ""}`} aria-label={repeatOne ? "关闭单曲循环" : "单曲循环"} aria-pressed={repeatOne} title="单曲循环 (R)" onClick={toggleRepeat}>↻</button>
             </div>
             <div className="progress-row" style={{ "--progress": `${progress}%` } as React.CSSProperties}>
               {transitionDisplay && activeTransitionRef.current?.id === transitionDisplay.id ? <span className="transition-time-stack"><span className="transition-outgoing">{formatTime(activeTransitionRef.current.outgoing.currentTime)}</span><span className="transition-incoming">{formatTime(activeTransitionRef.current.incoming.currentTime)}</span></span> : <span>{activeQQTrack ? formatTime(playbackTime.current) : formatProgress(progress)}</span>}
@@ -6558,10 +6603,46 @@ export function RadioExperience() {
         </div>
         <div className="setting-group compact">
           <label className="switch-row"><span><strong>潜流 · 无缝电台</strong><small>让相近的歌曲自然连成一段旅程</small></span><input type="checkbox" checked={seamless} onChange={(event) => setSeamless(event.target.checked)} /><i /></label>
+          <label className="switch-row"><span><strong>单曲循环</strong><small>这首歌会一直播下去，潜流衔接暂停</small></span><input type="checkbox" checked={repeatOne} onChange={toggleRepeat} /><i /></label>
+        </div>
+        <div className="setting-group">
+          <div className="setting-title"><strong>SLEEP TIMER</strong><small>{sleepTimer ? (sleepTimer.kind === "track" ? "这首歌结束后停止" : `${formatSleepRemaining(sleepRemaining)} 后轻轻停下`) : "到点后在最后 20 秒慢慢淡出，不会突然中断"}</small></div>
+          <div className="sleep-options">
+            {SLEEP_TIMER_MINUTES.map((minutes) => (
+              <button key={minutes} type="button" className={sleepTimer?.kind === "clock" && sleepTimer.minutes === minutes ? "selected" : ""} onClick={() => startSleepTimer(minutes)}>{minutes}<small>MIN</small></button>
+            ))}
+            <button type="button" className={sleepTimer?.kind === "track" ? "selected" : ""} onClick={() => startSleepTimer("track")}>本曲<small>结束</small></button>
+            {sleepTimer && <button type="button" className="sleep-cancel" onClick={() => cancelSleepTimer()}>取消</button>}
+          </div>
+        </div>
+        <div className="setting-group">
+          <div className="setting-title"><strong>KEYBOARD</strong><small>按 ? 随时查看；在输入框里打字不会触发</small></div>
+          <ul className="shortcut-list">
+            {SHORTCUT_GUIDE.map((item) => <li key={item.label}><span>{item.keys.map((key) => <kbd key={key}>{key}</kbd>)}</span><small>{item.label}</small></li>)}
+          </ul>
+        </div>
+        <div className="setting-group">
+          <div className="setting-title"><strong>YOUR DATA</strong><small>听歌记忆、画像、历史和设置只在这台电脑。备份文件可以带到新电脑；不包含 QQ 登录和 DeepSeek Key</small></div>
+          <div className="backup-row">
+            <button type="button" onClick={exportListeningData}>EXPORT BACKUP</button>
+            <button type="button" onClick={() => backupInputRef.current?.click()}>RESTORE FROM FILE</button>
+            <input ref={backupInputRef} type="file" accept="application/json,.json" hidden onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; void importListeningData(file); }} />
+          </div>
+          {backupNotice && <p className="backup-notice">{backupNotice}</p>}
         </div>
         <div className="setting-group compact onboarding-reopen-row">
           <span><strong>FIRST LISTEN GUIDE</strong><small>重新查看连接步骤；不会清除 QQ 登录、DeepSeek Key、画像或历史</small></span>
           <button type="button" onClick={reopenOnboarding}>OPEN GUIDE</button>
+        </div>
+      </section>
+
+      <div className={`modal-backdrop ${shortcutsOpen ? "visible" : ""}`} onClick={() => setShortcutsOpen(false)} />
+      <section className={`settings-modal shortcuts-modal ${shortcutsOpen ? "open" : ""}`} aria-hidden={!shortcutsOpen} aria-label="键盘快捷键">
+        <header><div><small>KEYBOARD</small><h2>Shortcuts <span>快捷键</span></h2></div><button onClick={() => setShortcutsOpen(false)}>×</button></header>
+        <div className="setting-group compact">
+          <ul className="shortcut-list">
+            {SHORTCUT_GUIDE.map((item) => <li key={item.label}><span>{item.keys.map((key) => <kbd key={key}>{key}</kbd>)}</span><small>{item.label}</small></li>)}
+          </ul>
         </div>
       </section>
 
